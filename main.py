@@ -1,10 +1,10 @@
 import json
+from collections import defaultdict
 from datetime import datetime
 from typing import Any
 
 import matplotlib.pyplot as plt
 from numpy import arange, ndarray
-from pandas import DataFrame, pivot_table
 
 
 def load_telegram_data(json_file: str) -> dict[str, Any]:
@@ -48,8 +48,7 @@ def extract_timestamps(messages: list[dict[str, Any]]) -> list[datetime]:
     """
     timestamps = []
     for msg in messages:
-        date_str = msg.get('date')
-        if date_str:
+        if date_str := msg.get('date'):
             try:
                 dt = datetime.fromisoformat(date_str)
                 timestamps.append(dt)
@@ -57,7 +56,7 @@ def extract_timestamps(messages: list[dict[str, Any]]) -> list[datetime]:
                 continue
 
     if not timestamps:
-        raise ValueError('Сообщения не найдены или формат даты некорректен')
+        raise ValueError('Message not found or date format is incorrect')
 
     return timestamps
 
@@ -87,75 +86,100 @@ def create_interval_labels(hour_interval: int) -> dict[int, str]:
     return interval_labels
 
 
-def create_message_dataframe(
+def aggregate_message_data(
     timestamps: list[datetime],
     hour_interval: int,
-) -> tuple[DataFrame, dict[int, str]]:
-    """Create a DataFrame from timestamps and add time interval information.
+) -> tuple[dict, list, dict[int, str]]:
+    """Aggregate message data by date and time interval without using pandas.
 
     Args:
         timestamps (list[datetime]): list of message datetime objects.
         hour_interval (int): The interval in hours to group messages by.
 
     Returns:
-        tuple[DataFrame, dict[int, str]]:
-            A tuple containing the message DataFrame and interval labels.
+        tuple[dict, list, dict[int, str]]:
+            A tuple containing the message counts by date and interval,
+            list of unique dates, and interval labels.
     """
-    df = DataFrame({'datetime': timestamps})
-    df['date'] = df['datetime'].dt.date
-    df['hour'] = df['datetime'].dt.hour
-    df['hour_interval'] = (df['hour'] // hour_interval) * hour_interval
+    message_counts = defaultdict(lambda: defaultdict(int))
+    dates = set()
 
+    for dt in timestamps:
+        date = dt.date()
+        hour = dt.hour
+        hour_interval_val = (hour // hour_interval) * hour_interval
+
+        message_counts[date][hour_interval_val] += 1
+        dates.add(date)
+
+    unique_dates = sorted(dates)
     interval_labels = create_interval_labels(hour_interval)
-    df['interval_label'] = df['hour_interval'].map(interval_labels)
 
-    return df, interval_labels
+    return message_counts, unique_dates, interval_labels
 
 
-def aggregate_message_data(
-    df: DataFrame,
-    interval_labels: dict[int, str],
+def find_last_day_hour_intervals(
+    timestamps: list[datetime],
     hour_interval: int,
-) -> DataFrame:
-    """Aggregate message data by date and time interval.
+) -> list[int]:
+    """Find the available hour intervals in the last day of data.
 
     Args:
-        df (DataFrame): DataFrame containing message data.
-        interval_labels (dict[int, str]):
-            Dictionary mapping hour intervals to their labels.
+        timestamps (list[datetime]): list of message datetime objects.
         hour_interval (int): The interval in hours to group messages by.
 
     Returns:
-        DataFrame: A pivot table with aggregated message counts.
+        list[int]: list of hour intervals available in the last day.
     """
-    message_counts = (
-        df.groupby(['date', 'hour_interval']).size().reset_index(name='count')
-    )
-    unique_dates = sorted(df['date'].unique())
+    if not timestamps:
+        return list(range(0, 24, hour_interval))
 
-    pivot_data = pivot_table(
-        message_counts,
-        index='date',
-        columns='hour_interval',
-        values='count',
-        fill_value=0,
-    ).reindex(unique_dates)
+    max_date = max(dt.date() for dt in timestamps)
 
-    try:
-        pivot_data.columns = [interval_labels[col] for col in pivot_data.columns]
-    except KeyError:
-        for col in pivot_data.columns:
-            if col not in interval_labels:
-                if hour_interval == 1:
-                    interval_labels[col] = f'{col:02d}'
-                else:
-                    end_hour = col + hour_interval - 1
-                    if end_hour >= 24:
-                        end_hour = 23
-                    interval_labels[col] = f'{col:02d}-{end_hour:02d}'
-        pivot_data.columns = [interval_labels[col] for col in pivot_data.columns]
+    max_hour = 0
+    for dt in timestamps:
+        if dt.date() == max_date and dt.hour > max_hour:
+            max_hour = dt.hour
 
-    return pivot_data
+    max_interval = (max_hour // hour_interval) * hour_interval
+
+    intervals = list(range(0, max_interval + hour_interval, hour_interval))
+
+    return intervals
+
+
+def create_pivot_data(
+    message_counts: dict,
+    unique_dates: list,
+    interval_labels: dict[int, str],
+    hour_interval: int,
+) -> tuple[dict, list]:
+    """Create pivot data structure similar to pandas pivot table.
+
+    Args:
+        message_counts (dict): Dictionary containing message counts by date and
+            interval.
+        unique_dates (list): list of unique dates.
+        interval_labels (dict[int, str]): Dictionary mapping hour intervals to
+            their labels.
+        hour_interval (int): The interval in hours to group messages by.
+
+    Returns:
+        tuple[dict, list]: A tuple containing the pivot data and a list of
+            interval columns.
+    """
+    all_intervals = list(range(0, 24, hour_interval))
+    interval_columns = [interval_labels[interval] for interval in all_intervals]
+
+    pivot_data = {}
+    for date in unique_dates:
+        pivot_data[date] = {}
+        for interval in all_intervals:
+            pivot_data[date][interval_labels[interval]] = message_counts[date][
+                interval
+            ]
+
+    return pivot_data, interval_columns
 
 
 def add_value_labels(ax: plt.Axes, bars: list[plt.Rectangle]) -> None:
@@ -183,8 +207,9 @@ def add_value_labels(ax: plt.Axes, bars: list[plt.Rectangle]) -> None:
 def configure_chart_appearance(
     ax: plt.Axes,
     positions: ndarray,
-    pivot_data: DataFrame,
+    unique_dates: list[datetime],
     user_name: str,
+    interval_columns: list,
     num_intervals: int,
     bar_width: float,
 ) -> None:
@@ -193,27 +218,27 @@ def configure_chart_appearance(
     Args:
         ax (plt.Axes): The axes to configure.
         positions (np.ndarray): Array of x-positions for bars.
-        pivot_data (DataFrame): DataFrame with pivot table data.
+        unique_dates (list): list of unique dates.
         user_name (str): Name of the user being analyzed.
+        interval_columns (list): list of interval column labels.
         num_intervals (int): Number of time intervals.
         bar_width (float): Width of each bar.
     """
     ax.set_xticks(positions)
     ax.set_xticklabels(
-        [date.strftime('%Y-%m-%d') for date in pivot_data.index],
-        rotation=45,
+        [date.strftime('%Y-%m-%d') for date in unique_dates],
+
     )
 
     ax.set_xlabel('Date', fontsize=12)
     ax.set_ylabel('Number of messages', fontsize=12)
     ax.set_title(
-        f'Activity of user {user_name} by time intervals',
+        f'Activity of user *{user_name}* by time intervals',
         fontsize=14,
-        fontweight='bold',
     )
 
-    bottom_offset = -3
-    for i, interval in enumerate(pivot_data.columns):
+    bottom_offset = -0.7
+    for i, interval in enumerate(interval_columns):
         offset = (i - num_intervals / 2 + 0.5) * bar_width
         for pos in positions:
             ax.text(
@@ -225,6 +250,16 @@ def configure_chart_appearance(
                 fontsize=8,
             )
 
+    if len(positions) > 1:
+        for i in range(1, len(positions)):
+            ax.axvline(
+                x=(positions[i - 1] + positions[i]) / 2,
+                color='black',
+                linestyle='-',
+                linewidth=2,
+                alpha=0.7,
+            )
+
     if ax.get_legend():
         ax.get_legend().remove()
 
@@ -233,7 +268,9 @@ def configure_chart_appearance(
 
 
 def plot_message_chart(
-    pivot_data: DataFrame,
+    pivot_data: dict,
+    interval_columns: list,
+    unique_dates: list,
     user_name: str,
     hour_interval: int,
     color_theme: str = 'viridis',
@@ -241,7 +278,9 @@ def plot_message_chart(
     """Create a bar chart visualization of message activity.
 
     Args:
-        pivot_data (DataFrame): DataFrame with pivot table data.
+        pivot_data (dict): Dictionary with pivot table data.
+        interval_columns (list): list of interval column labels.
+        unique_dates (list): list of unique dates.
         user_name (str): Name of the user being analyzed.
         hour_interval (int): The interval in hours messages are grouped by.
         color_theme (str, optional): Color theme for the chart.
@@ -253,23 +292,27 @@ def plot_message_chart(
     fig, ax = plt.subplots(figsize=(14, 10))
 
     num_intervals = 24 // hour_interval
-    num_dates = len(pivot_data.index)
+
+    num_dates = len(unique_dates)
     bar_width = 0.8 / num_intervals
 
     positions = arange(num_dates)
     colors = plt.get_cmap(color_theme)
 
     # Find maximum value for color normalization
-    max_value = pivot_data.max().max()
+    max_value = 0
+    for date in unique_dates:
+        for interval in interval_columns:
+            max_value = max(max_value, pivot_data[date].get(interval, 0))
 
     bars = []
-    for i, interval in enumerate(pivot_data.columns):
+    for i, interval in enumerate(interval_columns):
         offset = (i - num_intervals / 2 + 0.5) * bar_width
 
-        column_values = pivot_data[interval].values
         column_bars = []
+        for j, date in enumerate(unique_dates):
+            value = pivot_data[date].get(interval, 0)
 
-        for j, value in enumerate(column_values):
             # Normalize value to determine color intensity
             color_intensity = value / max_value if max_value > 0 else 0
             bar = ax.bar(
@@ -287,8 +330,9 @@ def plot_message_chart(
     configure_chart_appearance(
         ax,
         positions,
-        pivot_data,
+        unique_dates,
         user_name,
+        interval_columns,
         num_intervals,
         bar_width,
     )
@@ -321,10 +365,26 @@ def analyze_telegram_messages(
     user_messages = filter_user_messages(data, user_name)
     timestamps = extract_timestamps(user_messages)
 
-    df, interval_labels = create_message_dataframe(timestamps, hour_interval)
-    pivot_data = aggregate_message_data(df, interval_labels, hour_interval)
+    message_counts, unique_dates, interval_labels = aggregate_message_data(
+        timestamps,
+        hour_interval,
+    )
 
-    fig = plot_message_chart(pivot_data, user_name, hour_interval, color_theme)
+    pivot_data, interval_columns = create_pivot_data(
+        message_counts,
+        unique_dates,
+        interval_labels,
+        hour_interval,
+    )
+
+    fig = plot_message_chart(
+        pivot_data,
+        interval_columns,
+        unique_dates,
+        user_name,
+        hour_interval,
+        color_theme,
+    )
 
     return fig
 
@@ -333,7 +393,7 @@ if __name__ == '__main__':
     fig = analyze_telegram_messages(
         'result.json',
         'MRossa',
-        hour_interval=1,
-        color_theme='ocean',
+        hour_interval=8,
+        color_theme='ocean_r',
     )
     plt.show()
